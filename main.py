@@ -23,19 +23,42 @@ def root():
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    image_bytes = await file.read()
+    try:
+        print("=== PREDICT REQUEST STARTED ===")
+        print("Filename:", file.filename)
+        print("Content type:", file.content_type)
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image_bytes = await file.read()
 
-    # IMPORTANT:
-    # এখানে তোমার model-এর actual input size বসাতে হবে
-    image = image.resize((224, 224))
+        print("Image bytes:", len(image_bytes))
 
-    image_array = np.array(image) / 255.0
-    image_array = np.expand_dims(image_array, axis=0)
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        ).convert("RGB")
 
-    prediction = model.predict(image_array)
+        print("Original image size:", image.size)
 
-    return {
-        "prediction": prediction.tolist()
-    }
+        image = image.resize((224, 224))
+
+        image_array = np.array(image, dtype=np.float32) / 255.0
+        image_array = np.expand_dims(image_array, axis=0)
+
+        print("Input shape:", image_array.shape)
+        print("Input dtype:", image_array.dtype)
+
+        prediction = model.predict(image_array)
+
+        print("Prediction:", prediction)
+
+        return {
+            "prediction": prediction.tolist()
+        }
+
+    except Exception as e:
+        print("=== PREDICTION ERROR ===")
+        print(str(e))
+        traceback.print_exc()
+
+        return {
+            "error": str(e)
+        }
