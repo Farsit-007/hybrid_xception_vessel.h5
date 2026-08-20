@@ -25,7 +25,7 @@ MODEL_PATH = "model/hybrid_xception_vessel.h5"
 
 IMAGE_SIZE = (224, 224)
 
-CLASS_NAME= [
+CLASS_NAMES= [
     "CSCR",
     "Cataract",
     "Diabetic Retinopathy",
