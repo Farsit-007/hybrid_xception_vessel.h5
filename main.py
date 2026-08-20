@@ -1,10 +1,10 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 import numpy as np
 import tensorflow as tf
-import cv2
 import io
 import traceback
+import gc
 
 
 # =========================================================
@@ -46,7 +46,6 @@ CLASS_NAMES = [
 # =========================================================
 
 try:
-
     model = tf.keras.models.load_model(
         MODEL_PATH,
         compile=False
@@ -80,13 +79,46 @@ except Exception as e:
 
 
 # =========================================================
-# IMAGE DECODING
+# MODEL INPUT VALIDATION
+# =========================================================
+
+MODEL_INPUT_NAMES = [
+    tensor.name.split(":")[0]
+    for tensor in model.inputs
+]
+
+EXPECTED_INPUTS = {
+    "image_input",
+    "vessel_input"
+}
+
+if not EXPECTED_INPUTS.issubset(set(MODEL_INPUT_NAMES)):
+
+    raise RuntimeError(
+        "Model input configuration is not supported. "
+        f"Expected inputs: {EXPECTED_INPUTS}. "
+        f"Found: {MODEL_INPUT_NAMES}"
+    )
+
+if len(CLASS_NAMES) != model.output_shape[-1]:
+
+    raise RuntimeError(
+        f"Class configuration mismatch. "
+        f"Model outputs {model.output_shape[-1]} classes, "
+        f"but {len(CLASS_NAMES)} class names are configured."
+    )
+
+
+# =========================================================
+# IMAGE LOADING
 # =========================================================
 
 def load_image(image_bytes: bytes) -> Image.Image:
 
     if not image_bytes:
-        raise ValueError("Uploaded image is empty.")
+        raise ValueError(
+            "Uploaded image is empty."
+        )
 
     try:
 
@@ -94,13 +126,9 @@ def load_image(image_bytes: bytes) -> Image.Image:
             io.BytesIO(image_bytes)
         )
 
-        # Verify image integrity
-        image.verify()
+        image.load()
 
-        # Re-open after verify()
-        image = Image.open(
-            io.BytesIO(image_bytes)
-        ).convert("RGB")
+        image = image.convert("RGB")
 
         return image
 
@@ -116,194 +144,163 @@ def load_image(image_bytes: bytes) -> Image.Image:
 # IMAGE PREPROCESSING
 # =========================================================
 
-def preprocess_image(image: Image.Image) -> np.ndarray:
-
-    original_size = image.size
+def preprocess_image(
+    image: Image.Image
+) -> np.ndarray:
 
     image = image.resize(
         IMAGE_SIZE,
         Image.Resampling.BILINEAR
     )
 
-    image_array = np.array(
+    image_array = np.asarray(
         image,
         dtype=np.float32
     )
 
-    image_array = image_array / 255.0
+    image_array *= (1.0 / 255.0)
 
     image_array = np.expand_dims(
         image_array,
         axis=0
     )
 
-    print(
-        f"Original image: {original_size} "
-        f"-> Processed: {image_array.shape}"
-    )
-
     return image_array
 
 
 # =========================================================
-# VESSEL EXTRACTION
+# LIGHTWEIGHT VESSEL EXTRACTION
 # =========================================================
 
-def extract_vessels(image: Image.Image) -> Image.Image:
+def extract_vessels(
+    image: Image.Image
+) -> Image.Image:
+
     """
-    Extract an approximate retinal vessel map from the
-    uploaded retinal image.
+    Lightweight retinal vessel extraction.
 
     Pipeline:
-        RGB
-        -> Green channel
-        -> CLAHE enhancement
-        -> Gaussian blur
-        -> BlackHat morphology
-        -> Threshold
-        -> Morphological cleanup
-        -> 3-channel vessel image
 
-    Returns:
-        PIL Image in RGB format.
+        RGB
+          ↓
+        Green channel
+          ↓
+        Contrast enhancement
+          ↓
+        Background smoothing
+          ↓
+        Vessel enhancement
+          ↓
+        Threshold
+          ↓
+        Binary vessel map
+          ↓
+        RGB
+
+    This implementation intentionally avoids OpenCV
+    to reduce memory usage on low-memory hosting.
     """
 
-    print("\n----------------------------------------")
-    print("STARTING VESSEL EXTRACTION")
-    print("----------------------------------------")
+    # -----------------------------------------------------
+    # Resize before processing
+    # -----------------------------------------------------
 
-    # Convert PIL -> NumPy
-    rgb = np.array(image)
-
-    # OpenCV expects RGB/BGR array here
-    green_channel = rgb[:, :, 1]
-
-    print(
-        "Green channel shape:",
-        green_channel.shape
+    image = image.resize(
+        IMAGE_SIZE,
+        Image.Resampling.BILINEAR
     )
 
     # -----------------------------------------------------
-    # CLAHE
+    # Convert to grayscale
     # -----------------------------------------------------
 
-    clahe = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8)
+    gray = ImageOps.grayscale(image)
+
+    # -----------------------------------------------------
+    # Enhance local contrast
+    # -----------------------------------------------------
+
+    enhanced = ImageOps.autocontrast(gray)
+
+    # -----------------------------------------------------
+    # Create blurred background
+    # -----------------------------------------------------
+
+    blurred = enhanced.filter(
+        ImageFilter.GaussianBlur(radius=5)
     )
 
-    enhanced = clahe.apply(
-        green_channel
-    )
-
     # -----------------------------------------------------
-    # Gaussian blur
+    # Convert to NumPy
     # -----------------------------------------------------
 
-    blurred = cv2.GaussianBlur(
+    enhanced_array = np.asarray(
         enhanced,
-        (5, 5),
-        0
+        dtype=np.float32
     )
 
-    # -----------------------------------------------------
-    # BlackHat morphology
-    # -----------------------------------------------------
-
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (15, 15)
-    )
-
-    blackhat = cv2.morphologyEx(
+    blurred_array = np.asarray(
         blurred,
-        cv2.MORPH_BLACKHAT,
-        kernel
+        dtype=np.float32
     )
 
     # -----------------------------------------------------
-    # Normalize blackhat result
+    # Vessel enhancement
+    #
+    # Blood vessels are darker than surrounding retina.
+    # Therefore:
+    #
+    # background - image
+    #
+    # produces a vessel-like response.
     # -----------------------------------------------------
 
-    blackhat = cv2.normalize(
-        blackhat,
-        None,
-        0,
-        255,
-        cv2.NORM_MINMAX
+    vessel_response = (
+        blurred_array - enhanced_array
     )
 
-    blackhat = blackhat.astype(
-        np.uint8
-    )
+    # -----------------------------------------------------
+    # Normalize
+    # -----------------------------------------------------
+
+    min_value = vessel_response.min()
+    max_value = vessel_response.max()
+
+    if max_value > min_value:
+
+        vessel_response = (
+            vessel_response - min_value
+        ) / (
+            max_value - min_value
+        )
+
+    else:
+
+        vessel_response = np.zeros_like(
+            vessel_response
+        )
 
     # -----------------------------------------------------
     # Threshold
     # -----------------------------------------------------
 
-    _, vessel_mask = cv2.threshold(
-        blackhat,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    threshold = np.percentile(
+        vessel_response,
+        85
     )
 
-    # -----------------------------------------------------
-    # Morphological cleanup
-    # -----------------------------------------------------
-
-    cleanup_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (3, 3)
-    )
-
-    vessel_mask = cv2.morphologyEx(
-        vessel_mask,
-        cv2.MORPH_OPEN,
-        cleanup_kernel
-    )
-
-    vessel_mask = cv2.morphologyEx(
-        vessel_mask,
-        cv2.MORPH_CLOSE,
-        cleanup_kernel
-    )
+    vessel_mask = (
+        vessel_response > threshold
+    ).astype(np.uint8) * 255
 
     # -----------------------------------------------------
-    # Resize to model size
+    # Convert mask to RGB
     # -----------------------------------------------------
-
-    vessel_mask = cv2.resize(
-        vessel_mask,
-        IMAGE_SIZE,
-        interpolation=cv2.INTER_AREA
-    )
-
-    # -----------------------------------------------------
-    # Convert grayscale vessel map to RGB
-    # -----------------------------------------------------
-
-    vessel_rgb = cv2.cvtColor(
-        vessel_mask,
-        cv2.COLOR_GRAY2RGB
-    )
 
     vessel_image = Image.fromarray(
-        vessel_rgb
-    )
-
-    print(
-        "Vessel extraction completed."
-    )
-
-    print(
-        "Vessel image size:",
-        vessel_image.size
-    )
-
-    print("----------------------------------------")
-    print("VESSEL EXTRACTION FINISHED")
-    print("----------------------------------------\n")
+        vessel_mask,
+        mode="L"
+    ).convert("RGB")
 
     return vessel_image
 
@@ -334,11 +331,9 @@ def health():
         "success": True,
         "status": "healthy",
         "model_loaded": model is not None,
-        "model_inputs": [
-            tensor.name.split(":")[0]
-            for tensor in model.inputs
-        ],
-        "model_input_size": "224x224"
+        "model_inputs": MODEL_INPUT_NAMES,
+        "input_size": "224x224",
+        "vessel_extraction": "automatic"
     }
 
 
@@ -389,7 +384,7 @@ async def predict(
             )
 
         # -------------------------------------------------
-        # Load original image
+        # Load image
         # -------------------------------------------------
 
         original_image = load_image(
@@ -410,16 +405,25 @@ async def predict(
         )
 
         print(
-            "image_input shape:",
-            image_array.shape
+            "image_input:",
+            image_array.shape,
+            image_array.dtype
         )
 
         # -------------------------------------------------
         # Automatically extract vessels
         # -------------------------------------------------
 
+        print(
+            "Extracting vessels automatically..."
+        )
+
         vessel_image = extract_vessels(
             original_image
+        )
+
+        print(
+            "Vessel extraction completed."
         )
 
         # -------------------------------------------------
@@ -431,42 +435,23 @@ async def predict(
         )
 
         print(
-            "vessel_input shape:",
-            vessel_array.shape
+            "vessel_input:",
+            vessel_array.shape,
+            vessel_array.dtype
         )
 
         # -------------------------------------------------
-        # Check model inputs
+        # Release unnecessary image objects
         # -------------------------------------------------
 
-        model_input_names = [
-            tensor.name.split(":")[0]
-            for tensor in model.inputs
-        ]
+        del vessel_image
+        del original_image
+        del image_bytes
 
-        print(
-            "Model inputs:",
-            model_input_names
-        )
-
-        required_inputs = {
-            "image_input",
-            "vessel_input"
-        }
-
-        if not required_inputs.issubset(
-            set(model_input_names)
-        ):
-
-            raise ValueError(
-                "Model input configuration does not "
-                "match expected inputs. "
-                f"Expected: {list(required_inputs)}, "
-                f"Found: {model_input_names}"
-            )
+        gc.collect()
 
         # -------------------------------------------------
-        # Run model
+        # Run model prediction
         # -------------------------------------------------
 
         print(
@@ -481,10 +466,14 @@ async def predict(
             verbose=0
         )
 
-        print(
-            "Raw prediction:",
-            prediction
-        )
+        # -------------------------------------------------
+        # Release input arrays after prediction
+        # -------------------------------------------------
+
+        del image_array
+        del vessel_array
+
+        gc.collect()
 
         # -------------------------------------------------
         # Validate prediction
@@ -496,25 +485,20 @@ async def predict(
                 "Model returned an empty prediction."
             )
 
-        if len(prediction) == 0:
-
-            raise ValueError(
-                "Model returned no prediction results."
-            )
-
-        probabilities = prediction[0]
+        probabilities = np.asarray(
+            prediction[0]
+        )
 
         if len(probabilities) != len(CLASS_NAMES):
 
             raise ValueError(
-                f"Model returned "
-                f"{len(probabilities)} classes, "
-                f"but {len(CLASS_NAMES)} class names "
-                f"are configured."
+                f"Model returned {len(probabilities)} "
+                f"classes, but {len(CLASS_NAMES)} "
+                f"class names are configured."
             )
 
         # -------------------------------------------------
-        # Get predicted class
+        # Predicted class
         # -------------------------------------------------
 
         predicted_index = int(
@@ -543,35 +527,37 @@ async def predict(
                 probability
             )
 
-            probability_details.append({
+            probability_details.append(
+                {
+                    "class_index": index,
+                    "class_name": CLASS_NAMES[index],
+                    "probability": round(
+                        probability,
+                        6
+                    ),
+                    "percentage": round(
+                        probability * 100,
+                        2
+                    )
+                }
+            )
 
-                "class_index": index,
+        # -------------------------------------------------
+        # Sort highest probability first
+        # -------------------------------------------------
 
-                "class_name": CLASS_NAMES[index],
-
-                "probability": round(
-                    probability,
-                    6
-                ),
-
-                "percentage": round(
-                    probability * 100,
-                    2
-                )
-
-            })
-
-        # Highest probability first
         probability_details.sort(
             key=lambda item: item["probability"],
             reverse=True
         )
 
         # -------------------------------------------------
-        # Top 3 predictions
+        # Top 3
         # -------------------------------------------------
 
-        top_predictions = probability_details[:3]
+        top_predictions = (
+            probability_details[:3]
+        )
 
         # -------------------------------------------------
         # Final response
@@ -581,7 +567,9 @@ async def predict(
 
             "success": True,
 
-            "message": "Prediction completed successfully.",
+            "message": (
+                "Retinal image analyzed successfully."
+            ),
 
             "prediction": {
 
@@ -598,7 +586,6 @@ async def predict(
                     confidence * 100,
                     2
                 )
-
             },
 
             "top_predictions": top_predictions,
@@ -607,7 +594,9 @@ async def predict(
 
             "model": {
 
-                "name": "Hybrid Xception Vessel",
+                "name": (
+                    "Hybrid Xception Vessel"
+                ),
 
                 "version": "1.0.0",
 
@@ -618,8 +607,10 @@ async def predict(
                     "vessel_input"
                 ],
 
-                "vessel_extraction": "automatic"
-
+                "vessel_extraction": {
+                    "automatic": True,
+                    "source": "uploaded_image"
+                }
             }
 
         }
@@ -629,7 +620,7 @@ async def predict(
         # -------------------------------------------------
 
         print(
-            "\nPredicted class:",
+            "Predicted class:",
             predicted_class
         )
 
@@ -642,17 +633,9 @@ async def predict(
             "%"
         )
 
-        print(
-            "\n========================================"
-        )
-
-        print(
-            "PREDICTION SUCCESSFUL"
-        )
-
-        print(
-            "========================================\n"
-        )
+        print("\n========================================")
+        print("PREDICTION SUCCESSFUL")
+        print("========================================\n")
 
         return response
 
@@ -663,36 +646,17 @@ async def predict(
     except ValueError as e:
 
         print(
-            "\n========================================"
-        )
-
-        print(
-            "PREDICTION VALIDATION ERROR"
-        )
-
-        print(
-            "========================================"
-        )
-
-        print(
-            "Error:",
+            "\nPREDICTION VALIDATION ERROR:",
             str(e)
         )
 
         raise HTTPException(
-
             status_code=400,
-
             detail={
-
                 "success": False,
-
                 "message": "Invalid prediction request.",
-
                 "error": str(e)
-
             }
-
         )
 
     # =====================================================
@@ -702,36 +666,19 @@ async def predict(
     except Exception as e:
 
         print(
-            "\n========================================"
-        )
-
-        print(
-            "PREDICTION SERVER ERROR"
-        )
-
-        print(
-            "========================================"
-        )
-
-        print(
-            "Error:",
+            "\nPREDICTION SERVER ERROR:",
             str(e)
         )
 
         traceback.print_exc()
 
         raise HTTPException(
-
             status_code=500,
-
             detail={
-
                 "success": False,
-
-                "message": "Prediction failed due to a server error.",
-
+                "message": (
+                    "Prediction failed due to a server error."
+                ),
                 "error": str(e)
-
             }
-
         )
